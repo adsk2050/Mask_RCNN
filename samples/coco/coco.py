@@ -32,7 +32,8 @@ import sys
 import time
 import numpy as np
 import imgaug  # https://github.com/aleju/imgaug (pip3 install imgaug)
-
+import tensorflow as tf
+np.random.seed(1)
 # Download and install the Python COCO tools from https://github.com/waleedka/coco
 # That's a fork from the original https://github.com/pdollar/coco with a bug
 # fix for Python 3.
@@ -61,7 +62,7 @@ COCO_MODEL_PATH = os.path.join(ROOT_DIR, "mask_rcnn_coco.h5")
 # Directory to save logs and model checkpoints, if not provided
 # through the command line argument --logs
 DEFAULT_LOGS_DIR = os.path.join(ROOT_DIR, "logs")
-DEFAULT_DATASET_YEAR = "2014"
+DEFAULT_DATASET_YEAR = "2017"
 
 ############################################################
 #  Configurations
@@ -78,22 +79,34 @@ class CocoConfig(Config):
 
     # We use a GPU with 12GB memory, which can fit two images.
     # Adjust down if you use a smaller GPU.
-    IMAGES_PER_GPU = 2
+    IMAGES_PER_GPU = 1
 
     # Uncomment to train on 8 GPUs (default is 1)
     # GPU_COUNT = 8
 
     # Number of classes (including background)
-    NUM_CLASSES = 1 + 80  # COCO has 80 classes
+    NUM_CLASSES = 1 + 3  # COCO has 80 classes
 
+    # Number of training steps per epoch
+    # This doesn't need to match the size of the training set. Tensorboard
+    # updates are saved at the end of each epoch, so setting this to a
+    # smaller number means getting more frequent TensorBoard updates.
+    # Validation stats are also calculated at each epoch end and they
+    # might take a while, so don't set this too small to avoid spending
+    # a lot of time on validation stats.
+    STEPS_PER_EPOCH = 100
 
+    # Number of validation steps to run at the end of every training epoch.
+    # A bigger number improves accuracy of validation stats, but slows
+    # down the training.
+    VALIDATION_STEPS = 25
 ############################################################
 #  Dataset
 ############################################################
 
 class CocoDataset(utils.Dataset):
     def load_coco(self, dataset_dir, subset, year=DEFAULT_DATASET_YEAR, class_ids=None,
-                  class_map=None, return_coco=False, auto_download=False):
+                  class_map=None, return_coco=False, auto_download=False, class_max_count=None):
         """Load a subset of the COCO dataset.
         dataset_dir: The root directory of the COCO dataset.
         subset: What to load (train, val, minival, valminusminival)
@@ -121,8 +134,16 @@ class CocoDataset(utils.Dataset):
         # All images or a subset?
         if class_ids:
             image_ids = []
-            for id in class_ids:
-                image_ids.extend(list(coco.getImgIds(catIds=[id])))
+            # for id in class_ids:
+            #     image_ids.extend(list(coco.getImgIds(catIds=[id])))
+            for i in class_ids:
+                class_i_ids = list(coco.getImgIds(catIds=[i]))
+                class_i_img_counts = len(class_i_ids)
+                if class_max_count:
+                    if class_max_count <= class_i_img_counts:
+                        class_i_img_counts = class_max_count
+                class_i_ids = np.random.choice(a=class_i_ids, size=class_i_img_counts, replace=False)
+                image_ids.extend(list(class_i_ids))
             # Remove duplicates
             image_ids = list(set(image_ids))
         else:
@@ -448,87 +469,100 @@ if __name__ == '__main__':
             DETECTION_MIN_CONFIDENCE = 0
         config = InferenceConfig()
     config.display()
+    # strategy = tf.distribute.MultiWorkerMirroredStrategy()
+    strategy = tf.distribute.OneDeviceStrategy(device="/cpu:0")
+    with strategy.scope():
+        # Create model
+        if args.command == "train":
+            model = modellib.MaskRCNN(mode="training", config=config,
+                                      model_dir=args.logs)
+        else:
+            model = modellib.MaskRCNN(mode="inference", config=config,
+                                      model_dir=args.logs)
 
-    # Create model
-    if args.command == "train":
-        model = modellib.MaskRCNN(mode="training", config=config,
-                                  model_dir=args.logs)
-    else:
-        model = modellib.MaskRCNN(mode="inference", config=config,
-                                  model_dir=args.logs)
+        # Select weights file to load
+        if args.model.lower() == "coco":
+            model_path = COCO_MODEL_PATH
+            exclude = ["mrcnn_class_logits", "mrcnn_bbox_fc",
+                       "mrcnn_bbox", "mrcnn_mask"]
+        elif args.model.lower() == "last":
+            # Find last trained weights
+            model_path = model.find_last()
+            exclude = []
+        elif args.model.lower() == "imagenet":
+            # Start from ImageNet trained weights
+            model_path = model.get_imagenet_weights()
+            exclude = []
+        else:
+            model_path = args.model
+            exclude = []
 
-    # Select weights file to load
-    if args.model.lower() == "coco":
-        model_path = COCO_MODEL_PATH
-    elif args.model.lower() == "last":
-        # Find last trained weights
-        model_path = model.find_last()
-    elif args.model.lower() == "imagenet":
-        # Start from ImageNet trained weights
-        model_path = model.get_imagenet_weights()
-    else:
-        model_path = args.model
 
-    # Load weights
-    print("Loading weights ", model_path)
-    model.load_weights(model_path, by_name=True)
+        # Load weights
+        print("Loading weights ", model_path)
+        model.load_weights(model_path, exclude=exclude, by_name=True)
 
-    # Train or evaluate
-    if args.command == "train":
-        # Training dataset. Use the training set and 35K from the
-        # validation set, as as in the Mask RCNN paper.
-        dataset_train = CocoDataset()
-        dataset_train.load_coco(args.dataset, "train", year=args.year, auto_download=args.download)
-        if args.year in '2014':
-            dataset_train.load_coco(args.dataset, "valminusminival", year=args.year, auto_download=args.download)
-        dataset_train.prepare()
+        # Train or evaluate
+        if args.command == "train":
+            # Training dataset. Use the training set and 35K from the
+            # validation set, as as in the Mask RCNN paper.
+            dataset_train = CocoDataset()
+            dataset_train.load_coco(args.dataset, "train", year=args.year, auto_download=args.download,
+                                    class_max_count=150, class_ids=[1, 2, 3])
+            if args.year in '2014':
+                dataset_train.load_coco(args.dataset, "valminusminival", year=args.year, auto_download=args.download)
+            dataset_train.prepare()
 
-        # Validation dataset
-        dataset_val = CocoDataset()
-        val_type = "val" if args.year in '2017' else "minival"
-        dataset_val.load_coco(args.dataset, val_type, year=args.year, auto_download=args.download)
-        dataset_val.prepare()
+            # Validation dataset
+            dataset_val = CocoDataset()
+            val_type = "val" if args.year in '2017' else "minival"
+            dataset_val.load_coco(args.dataset, val_type, year=args.year, auto_download=args.download,
+                                  class_max_count=50, class_ids=[1, 2, 3])
+            dataset_val.prepare()
 
-        # Image Augmentation
-        # Right/Left flip 50% of the time
-        augmentation = imgaug.augmenters.Fliplr(0.5)
+            # Image Augmentation
+            # Right/Left flip 50% of the time
+            augmentation = imgaug.augmenters.Fliplr(0.5)
 
-        # *** This training schedule is an example. Update to your needs ***
+            # *** This training schedule is an example. Update to your needs ***
 
-        # Training - Stage 1
-        print("Training network heads")
-        model.train(dataset_train, dataset_val,
-                    learning_rate=config.LEARNING_RATE,
-                    epochs=40,
-                    layers='heads',
-                    augmentation=augmentation)
+            # Training - Stage 1
+            print("Training network heads")
+            # Earlier 40 epochs, changed to 5
+            model.train(dataset_train, dataset_val,
+                        learning_rate=config.LEARNING_RATE,
+                        epochs=5,
+                        layers='heads',
+                        augmentation=augmentation)
 
-        # Training - Stage 2
-        # Finetune layers from ResNet stage 4 and up
-        print("Fine tune Resnet stage 4 and up")
-        model.train(dataset_train, dataset_val,
-                    learning_rate=config.LEARNING_RATE,
-                    epochs=120,
-                    layers='4+',
-                    augmentation=augmentation)
+            # Training - Stage 2
+            # Finetune layers from ResNet stage 4 and up
+            print("Fine tune Resnet stage 4 and up")
+            # Earlier 120 epochs, changed to 10
+            model.train(dataset_train, dataset_val,
+                        learning_rate=config.LEARNING_RATE,
+                        epochs=10,
+                        layers='4+',
+                        augmentation=augmentation)
 
-        # Training - Stage 3
-        # Fine tune all layers
-        print("Fine tune all layers")
-        model.train(dataset_train, dataset_val,
-                    learning_rate=config.LEARNING_RATE / 10,
-                    epochs=160,
-                    layers='all',
-                    augmentation=augmentation)
+            # Training - Stage 3
+            # Fine tune all layers
+            print("Fine tune all layers")
+            # Earlier 160 epochs, changed to 12
+            model.train(dataset_train, dataset_val,
+                        learning_rate=config.LEARNING_RATE / 10,
+                        epochs=12,
+                        layers='all',
+                        augmentation=augmentation)
 
-    elif args.command == "evaluate":
-        # Validation dataset
-        dataset_val = CocoDataset()
-        val_type = "val" if args.year in '2017' else "minival"
-        coco = dataset_val.load_coco(args.dataset, val_type, year=args.year, return_coco=True, auto_download=args.download)
-        dataset_val.prepare()
-        print("Running COCO evaluation on {} images.".format(args.limit))
-        evaluate_coco(model, dataset_val, coco, "bbox", limit=int(args.limit))
-    else:
-        print("'{}' is not recognized. "
-              "Use 'train' or 'evaluate'".format(args.command))
+        elif args.command == "evaluate":
+            # Validation dataset
+            dataset_val = CocoDataset()
+            val_type = "val" if args.year in '2017' else "minival"
+            coco = dataset_val.load_coco(args.dataset, val_type, year=args.year, return_coco=True, auto_download=args.download)
+            dataset_val.prepare()
+            print("Running COCO evaluation on {} images.".format(args.limit))
+            evaluate_coco(model, dataset_val, coco, "bbox", limit=int(args.limit))
+        else:
+            print("'{}' is not recognized. "
+                  "Use 'train' or 'evaluate'".format(args.command))
