@@ -32,11 +32,11 @@ except Exception:
     install_reqs = []
 
 setup(
-    name='mask-rcnn',
-    version='2.1',
-    url='https://github.com/matterport/Mask_RCNN',
+    name='mrcnn',
+    version='2.2',
+    url='https://github.com/adsk2050/Mask_RCNN',
     author='Matterport',
-    author_email='waleed.abdulla@gmail.com',
+    author_email='adsk2050@gmail.com',
     license='MIT',
     description='Mask R-CNN for object detection and instance segmentation',
     packages=["mrcnn"],

@@ -1,6 +1,7 @@
 # Data files and directories common in repo root
 datasets/
 samples/coco/dataset/
+samples/fashionpedia/dataset/
 logs/
 *.h5
 results/
